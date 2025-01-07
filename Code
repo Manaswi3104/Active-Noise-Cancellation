@@ -1,0 +1,79 @@
+#include <driver/adc.h>
+#include <driver/dac.h>
+
+// Define pins
+#define PRIMARY_MIC_PIN ADC1_CHANNEL_6   // GPIO34 (Primary mic)
+#define REFERENCE_MIC_PIN ADC1_CHANNEL_5  // GPIO32 (Reference mic)
+#define DAC_PIN DAC_CHANNEL_1             // GPIO25 for DAC output
+
+// LMS filter parameters
+#define FILTER_LENGTH 64       // Increased filter length
+#define LEARNING_RATE 0.001    // Learning rate for LMS algorithm
+
+// Buffer for adaptive filter
+float weights[FILTER_LENGTH] = {0};              // Filter weights
+float primaryInputBuffer[FILTER_LENGTH] = {0};   // Circular buffer for primary input
+float referenceInputBuffer[FILTER_LENGTH] = {0}; // Circular buffer for reference input
+int bufferIndex = 0;                             // Current index in the circular buffer
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize ADC
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(PRIMARY_MIC_PIN, ADC_ATTEN_DB_11);  // 0-3.3V range
+  adc1_config_channel_atten(REFERENCE_MIC_PIN, ADC_ATTEN_DB_11); // 0-3.3V range
+
+  // Initialize DAC
+  dac_output_enable(DAC_PIN);
+}
+
+void loop() {
+  // Read raw microphone data
+  int primaryMicValue = adc1_get_raw(PRIMARY_MIC_PIN);
+  int referenceMicValue = adc1_get_raw(REFERENCE_MIC_PIN);
+
+  // Normalize ADC values to the range [-1.0, 1.0]
+  float primaryInput = ((float)primaryMicValue / 2048.0) - 1.0;
+  float referenceInput = ((float)referenceMicValue / 2048.0) - 1.0;
+
+  // Process the audio using LMS noise cancellation
+  float processedAudio = noiseCancel(primaryInput, referenceInput);
+
+  // Map processed audio to DAC output range (0-255 for ESP32 DAC)
+  int dacValue = (int)((processedAudio + 1.0) * 127.5);
+  dacValue = constrain(dacValue, 0, 255); // Ensure value is within DAC range
+
+  // Output the processed audio
+  dac_output_voltage(DAC_PIN, dacValue);
+
+  // Delay for sampling rate (e.g., ~8kHz)
+  delayMicroseconds(125);
+}
+
+// Adaptive Noise Cancellation with LMS filter for dual-mic
+float noiseCancel(float primaryInput, float referenceInput) {
+  float output = 0.0;
+
+  // Update the circular buffers with the current inputs
+  primaryInputBuffer[bufferIndex] = primaryInput;
+  referenceInputBuffer[bufferIndex] = referenceInput;
+
+  // Compute the filter output using both primary and reference signals
+  for (int i = 0; i < FILTER_LENGTH; i++) {
+    output += weights[i] * referenceInputBuffer[(bufferIndex - i + FILTER_LENGTH) % FILTER_LENGTH];
+  }
+
+  // Calculate the error (desired signal - noise approximation)
+  float error = primaryInput - output;
+
+  // Update filter weights using LMS algorithm
+  for (int i = 0; i < FILTER_LENGTH; i++) {
+    weights[i] += LEARNING_RATE * error * referenceInputBuffer[(bufferIndex - i + FILTER_LENGTH) % FILTER_LENGTH];
+  }
+
+  // Move to the next buffer index
+  bufferIndex = (bufferIndex + 1) % FILTER_LENGTH;
+
+  return error; // Return the error as the cleaned signal
+}
